@@ -750,7 +750,19 @@ def style_axes(ax, theme, log_x=False, log_y=False, grid_axis="y"):
     ax.tick_params(colors=theme["text_secondary"], labelsize=9)
 
 
-def draw_histograms(ax, cell, edges, theme, log_x=False, label=True):
+def draw_histograms(
+    ax,
+    cell,
+    edges,
+    theme,
+    log_x=False,
+    label=True,
+    series_labels=(FALLBACK_LABEL, SPARSE_LABEL),
+    show_system=True,
+    fontsize=9,
+    linewidth=2.0,
+    unit="us",
+):
     """The two series into one axes, and the `system` mean as a reference rule.
 
     Binned once and drawn twice per series. `ax.hist` would re-bin the whole array for each pass and
@@ -758,15 +770,18 @@ def draw_histograms(ax, cell, edges, theme, log_x=False, label=True):
     figure and a swap storm, and the counts are identical either way.
 
     Filled at low alpha with a 2px edge, so the overlap is legible either way round.
+
+    `series_labels`, `show_system`, `fontsize` and `linewidth` exist for `--paper`, which draws the
+    same figure at column width with short labels and leaves the explanation to the paper's caption.
     """
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
     for values, colour, series_label in (
-        (cell.fallback, theme["series"][0], FALLBACK_LABEL),
-        (cell.sparse, theme["series"][1], SPARSE_LABEL),
+        (cell.fallback, theme["series"][0], series_labels[0]),
+        (cell.sparse, theme["series"][1], series_labels[1]),
     ):
         counts, _ = np.histogram(values, bins=edges)
         ax.stairs(counts, edges, color=colour, alpha=0.45, fill=True, label=series_label, zorder=2)
-        ax.stairs(counts, edges, color=colour, linewidth=2.0, zorder=3)
+        ax.stairs(counts, edges, color=colour, linewidth=linewidth, zorder=3)
 
     def side_of(value):
         """Which side of its rule a label goes, as `(ha, x offset)`.
@@ -783,20 +798,22 @@ def draw_histograms(ax, cell, edges, theme, log_x=False, label=True):
     # Selective direct labels: the two means the figure is about, and the derived `system` mean as a
     # rule in text ink rather than a third series colour — it is a reference, not an identity.
     annotations = (
-        (mean_of(cell.fallback), theme["series"][0], theme["text_primary"], 0.97, "mean {:,.2f} us"),
-        (mean_of(cell.sparse), theme["series"][1], theme["text_primary"], 0.88, "mean {:,.2f} us"),
+        (mean_of(cell.fallback), theme["series"][0], theme["text_primary"], 0.97, "mean {:,.2f} " + unit),
+        (mean_of(cell.sparse), theme["series"][1], theme["text_primary"], 0.88, "mean {:,.2f} " + unit),
         (
             mean_of(cell.system),
             theme["text_secondary"],
             theme["text_secondary"],
             0.79,
-            "system mean {:,.2f} us",
+            "system mean {:,.2f} " + unit,
         ),
     )
     for index, (mean, rule_colour, text_colour, height, template) in enumerate(annotations):
         if not math.isfinite(mean):
             continue
         system = index == 2
+        if system and not show_system:
+            continue
         ax.axvline(
             mean,
             color=rule_colour,
@@ -813,7 +830,7 @@ def draw_histograms(ax, cell, edges, theme, log_x=False, label=True):
             xycoords=("data", "axes fraction"),
             ha=ha,
             va="top",
-            fontsize=9,
+            fontsize=fontsize,
             color=text_colour,
             xytext=(offset, 0),
             textcoords="offset points",
@@ -972,8 +989,59 @@ def caption_block(fig, theme, caption, top=0.94):
     fig.tight_layout(rect=(0, reserve, 1, top))
 
 
+PAPER_LABELS = ("pymatching on $\\mathcal{G}$ (fallback)", "SpecMatching, $k$ cores")
+
+
+def draw_cell_paper(run, cell, edges, args, theme):
+    """One cell at single-column width for a paper: the histograms and their means, nothing else.
+
+    No title and no caption block. Everything the long caption states — the shot count, the
+    escalations left out of the sparse series, the timer and the k-core model — belongs in the
+    paper's own caption, where it can be said once and in the paper's notation.
+    """
+    fig, ax = plt.subplots(figsize=(3.5, 2.1))
+    fig.patch.set_facecolor(theme["surface"])
+    ax.set_facecolor(theme["surface"])
+    labels = (PAPER_LABELS[0], PAPER_LABELS[1].replace("$k$", f"$k={cell.k:g}$"))
+    draw_histograms(
+        ax,
+        cell,
+        edges,
+        theme,
+        log_x=args.log_x,
+        series_labels=labels,
+        show_system=False,
+        fontsize=7,
+        linewidth=1.2,
+        unit=r"$\mu$s",
+    )
+    style_axes(ax, theme, args.log_x, args.log_y)
+    ax.tick_params(labelsize=7)
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_xlabel(r"per-shot latency ($\mu$s)", color=theme["text_secondary"], fontsize=8)
+    ax.set_ylabel("shots", color=theme["text_secondary"], fontsize=8)
+    # Thousands of shots, so the tick labels stay narrow at column width.
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1000:g}k" if value else "0"))
+    legend = ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.2), ncol=2, fontsize=7)
+    for text in legend.get_texts():
+        text.set_color(theme["text_primary"])
+    fig.tight_layout(pad=0.2)
+    return save(fig, args, run, f"flb_{cell.slug}", theme)
+
+
 def draw_cell(run, cell, edges, args, theme):
     """One `(d, p, T, k)` cell: the two distributions, their means, and what the caption must state."""
+    if args.paper:
+        written = draw_cell_paper(run, cell, edges, args, theme)
+        fallback, sparse, system = stats_of(cell.fallback), stats_of(cell.sparse), stats_of(cell.system)
+        return written, {
+            "cell": cell,
+            "fallback": fallback,
+            "sparse": sparse,
+            "system": system,
+            "speedup": fallback["mean"] / system["mean"] if system["mean"] else float("nan"),
+            "clipped": 0,
+        }
     fig, ax = plt.subplots(figsize=(9.0, 5.2))
     fig.patch.set_facecolor(theme["surface"])
     ax.set_facecolor(theme["surface"])
@@ -1722,6 +1790,12 @@ def main():
     parser.add_argument("--no-path", action="store_true", help="skip the critical-path breakdown")
     parser.add_argument("--no-work", action="store_true", help="skip the work-against-path figure")
     parser.add_argument("--no-structure", action="store_true", help="skip the cut-structure grid")
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help="per-cell histograms at single-column width with no title or caption block, for a paper"
+        " whose own caption carries the context; combine with --formats pdf",
+    )
     parser.add_argument("--theme", choices=sorted(THEMES), default="light")
     parser.add_argument("--table", action="store_true", help="print the summary table to stdout as well")
     args = parser.parse_args()
