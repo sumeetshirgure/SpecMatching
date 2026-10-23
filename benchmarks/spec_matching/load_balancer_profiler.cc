@@ -27,6 +27,17 @@
 /// `system` is defined by that and by nothing else (hard constraint 6), and every table derived
 /// from `shots.csv` computes it from those two lines.
 ///
+/// Beside the model, and without changing it, the CPU cost of producing the model's input is timed
+/// too, so the whole software pipeline of a shot has a distribution:
+///
+/// ```
+///   pipeline        = seed + hbuild + sparse_k
+///   system_pipeline = escalated ? fallback : min(fallback, pipeline)
+/// ```
+///
+/// `sparse_k` and `system` keep assuming the edge list arrives for free (from hardware);
+/// `pipeline` and `system_pipeline` are what the same shot costs when `H` is built on this CPU.
+///
 /// **Exactness is untouched.** The one edit under `src/specmatching/` is the `ResetPolicy` parameter
 /// on `Harvester::extract_only_to_*` described below; it defaults to the previous behaviour, changes
 /// no production call site, and moves no work — it only lets a caller choose where the teardown
@@ -57,11 +68,16 @@
 /// ## What is timed
 ///
 /// Per shot, in this order, each region bracketed by one timer pair. Nothing else in the shot is
-/// timed, and the edge list — `compute_seeded_detection_events` plus `build_ball_graph` — is **the
-/// input**: producing it is outside every timed region.
+/// timed. The edge list — `compute_seeded_detection_events` plus `build_ball_graph` — is **the
+/// input** of the `k`-core model: its two regions are timed on the CPU and reported in their own
+/// columns, but they are in no term of `sparse_k` or `system`.
 ///
 /// ```
-///     compute_seeded_detection_events + build_ball_graph        the input       NOT timed
+///   [ seed ]      compute_seeded_detection_events: the negative-weight preamble on G, sorted dets
+///   [ hbuild ]    build_ball_graph: the ball intersection that writes H, then its canonical sort.
+///                 Split inside the call by BallGraphTiming into hbuild_intersect and
+///                 hbuild_finalize, on the same thread-scoped clock; the split does not sum to
+///                 hbuild (the call's setup and the inner timer's own reads are the gap)
 ///   [ uf ]        union-find over H's defect-defect edges; comp id per defect; sizes
 ///   [ balance ]   cost lookup, LPT assignment, scatter of defects and edges into per-core slices
 ///   for c in [0, k):                                     (a core with no components is skipped)
@@ -101,14 +117,15 @@
 /// `0`, and it contributes nothing to the makespan, which is what an idle core contributes in the
 /// system being modelled. `run.log` records this as `empty_core_policy`.
 ///
-/// Timer reads per **measured** shot: `2 (uf) + 2 (balance) + 4 per non-empty core + 2 (combine) +
-/// 2 (fallback)`. Four per core rather than six because consecutive regions share their boundary
+/// Timer reads per **measured** shot: `3 (seed, hbuild) + 3 inside build_ball_graph + 2 (uf) +
+/// 2 (balance) + 4 per non-empty core + 2 (combine) + 2 (fallback)`. Four per core rather than six because consecutive regions share their boundary
 /// read; a `TRUNCATED` core reads three, since it has no extraction.
 ///
 /// **A warm-up shot is not profiled.** It runs the identical workload — same builds, same solves,
-/// same extractions, same fallback, same order, same buffers — and reads no clock at all: `run_shot`
-/// is templated on the switch, so the reads compile out of the warm-up instantiation rather than
-/// being taken and discarded. Rows are stored **uncorrected** —
+/// same extractions, same fallback, same order, same buffers — and reads no clock of its own:
+/// `run_shot` is templated on the switch, so the reads compile out of the warm-up instantiation
+/// rather than being taken and discarded. The one exception is the three reads `build_ball_graph`
+/// takes inside `hbuild`, which a warm-up shot also takes, so that the measured path is warm. Rows are stored **uncorrected** —
 /// `timer_overhead_ns` goes to `run.log` and the analysis subtracts it, because a correction baked
 /// into a row cannot be undone by a reader who disagrees with it.
 ///
@@ -367,6 +384,12 @@ struct Row {
     uint64_t sparse_k;
     uint64_t fallback;
     uint64_t system;
+    uint64_t seed;
+    uint64_t hbuild;
+    uint64_t hbuild_intersect;
+    uint64_t hbuild_finalize;
+    uint64_t pipeline;
+    uint64_t system_pipeline;
 };
 
 struct CellLabels {
@@ -410,7 +433,9 @@ struct RowArena {
                  << fmt_g(row.pred_sum) << "," << fmt_g(row.imbalance) << "," << row.crit_core << "," << row.crit_size
                  << "," << row.crit_ncomps << "," << row.uf << "," << row.balance << "," << row.build_crit << ","
                  << row.solve_crit << "," << row.extract_crit << "," << row.core_max << "," << row.combine << ","
-                 << row.sparse_k << "," << row.fallback << "," << row.system << "\n";
+                 << row.sparse_k << "," << row.fallback << "," << row.system << "," << row.seed << ","
+                 << row.hbuild << "," << row.hbuild_intersect << "," << row.hbuild_finalize << "," << row.pipeline
+                 << "," << row.system_pipeline << "\n";
         }
         rows_this_cell += rows.size();
         rows_total += rows.size();
@@ -461,6 +486,10 @@ struct CellAggregate {
     TickSeries fallback;
     TickSeries sparse_k;
     TickSeries system;
+    /// The CPU input pipeline: `H`'s construction alone, and the two whole-pipeline series.
+    TickSeries hbuild;
+    TickSeries pipeline;
+    TickSeries system_pipeline;
 
     __int128 uf_sum{0};
     __int128 balance_sum{0};
@@ -468,6 +497,9 @@ struct CellAggregate {
     __int128 solve_crit_sum{0};
     __int128 extract_crit_sum{0};
     __int128 combine_sum{0};
+    __int128 seed_sum{0};
+    __int128 hbuild_intersect_sum{0};
+    __int128 hbuild_finalize_sum{0};
 
     double imbalance_sum{0};
 
@@ -487,6 +519,12 @@ struct CellAggregate {
         fallback.clear();
         sparse_k.clear();
         system.clear();
+        hbuild.clear();
+        pipeline.clear();
+        system_pipeline.clear();
+        seed_sum = 0;
+        hbuild_intersect_sum = 0;
+        hbuild_finalize_sum = 0;
         uf_sum = 0;
         balance_sum = 0;
         build_crit_sum = 0;
@@ -635,6 +673,12 @@ struct ShotMeasurement {
     uint64_t sparse_k{0};
     uint64_t fallback{0};
     uint64_t system{0};
+    uint64_t seed{0};
+    uint64_t hbuild{0};
+    uint64_t hbuild_intersect{0};
+    uint64_t hbuild_finalize{0};
+    uint64_t pipeline{0};
+    uint64_t system_pipeline{0};
     /// The combined Phase-1 answer, for `--verify`. Not a column of `shots.csv`.
     pm::obs_int obs_mask{0};
     pm::total_weight_int weight{0};
@@ -774,11 +818,25 @@ struct CellRunner {
         };
 
         // ---- The input. `compute_seeded_detection_events` and `build_ball_graph` are the ball-table
-        // generator's edge list, and hard constraint 3 puts producing it outside every timed region.
+        // generator's edge list, and hard constraint 3 keeps producing it out of `sparse_k`. It is
+        // still timed here, on the CPU, into its own columns: `seed`, `hbuild`, and `hbuild`'s
+        // two-stage split, which `build_ball_graph` measures itself when handed a `BallGraphTiming`.
+        // A warm-up shot hands it one too and discards it: the timing branch inside the call is then
+        // warm when the first measured shot takes it, where with `nullptr` that shot paid a cold
+        // first pass (~40 us at d = 5). These three reads are the only ones a warm-up shot takes.
+        BallGraphTiming hbuild_timing;
+        uint64_t seed_started = tick();
         decoder->compute_seeded_detection_events(shot, decoder->seeded_scratch);
+        uint64_t seed_ended = tick();
         build_ball_graph(
-            decoder->tables, decoder->seeded_scratch, decoder->horizon, decoder->arena, decoder->config.mode, nullptr,
+            decoder->tables,
+            decoder->seeded_scratch,
+            decoder->horizon,
+            decoder->arena,
+            decoder->config.mode,
+            &hbuild_timing,
             nullptr);
+        uint64_t hbuild_ended = tick();
         const BallGraph& h = decoder->arena.graph;
         uint32_t n = (uint32_t)h.num_nodes();
 
@@ -1017,6 +1075,12 @@ struct CellRunner {
         out.sparse_k = out.uf + out.balance + out.core_max + out.combine;
         out.fallback = fallback_ended - fallback_started;
         out.system = out.escalated ? out.fallback : std::min(out.fallback, out.sparse_k);
+        out.seed = seed_ended - seed_started;
+        out.hbuild = hbuild_ended - seed_ended;
+        out.hbuild_intersect = (uint64_t)hbuild_timing.intersect_ns;
+        out.hbuild_finalize = (uint64_t)hbuild_timing.finalize_ns;
+        out.pipeline = out.seed + out.hbuild + out.sparse_k;
+        out.system_pipeline = out.escalated ? out.fallback : std::min(out.fallback, out.pipeline);
         out.obs_mask = obs_mask;
         out.weight = weight;
     }
@@ -1159,6 +1223,12 @@ Digest run_cell(
             row.sparse_k = measurement.sparse_k;
             row.fallback = measurement.fallback;
             row.system = measurement.system;
+            row.seed = measurement.seed;
+            row.hbuild = measurement.hbuild;
+            row.hbuild_intersect = measurement.hbuild_intersect;
+            row.hbuild_finalize = measurement.hbuild_finalize;
+            row.pipeline = measurement.pipeline;
+            row.system_pipeline = measurement.system_pipeline;
             arena.append(row);
 
             aggregate.shots++;
@@ -1166,6 +1236,12 @@ Digest run_cell(
             aggregate.fallback.add(measurement.fallback);
             aggregate.sparse_k.add(measurement.sparse_k);
             aggregate.system.add(measurement.system);
+            aggregate.hbuild.add(measurement.hbuild);
+            aggregate.pipeline.add(measurement.pipeline);
+            aggregate.system_pipeline.add(measurement.system_pipeline);
+            aggregate.seed_sum += (__int128)measurement.seed;
+            aggregate.hbuild_intersect_sum += (__int128)measurement.hbuild_intersect;
+            aggregate.hbuild_finalize_sum += (__int128)measurement.hbuild_finalize;
             aggregate.uf_sum += (__int128)measurement.uf;
             aggregate.balance_sum += (__int128)measurement.balance;
             aggregate.build_crit_sum += (__int128)measurement.build_crit;
@@ -1247,6 +1323,14 @@ void write_aggregate(std::ofstream& out, const Options& options, const std::vect
         write_series(out, "fallback", cell.fallback, ",");
         write_series(out, "sparse_k", cell.sparse_k, ",");
         write_series(out, "system", cell.system, ",");
+        write_series(out, "hbuild", cell.hbuild, ",");
+        write_series(out, "pipeline", cell.pipeline, ",");
+        write_series(out, "system_pipeline", cell.system_pipeline, ",");
+        // The input's regions, kept out of `module_means` so that those six still sum to `sparse_k`.
+        out << "      \"input_means\": {\"seed\": " << fmt_g(mean_of(cell.seed_sum, cell.shots))
+            << ", \"hbuild\": " << fmt_g(cell.hbuild.mean())
+            << ", \"hbuild_intersect\": " << fmt_g(mean_of(cell.hbuild_intersect_sum, cell.shots))
+            << ", \"hbuild_finalize\": " << fmt_g(mean_of(cell.hbuild_finalize_sum, cell.shots)) << "},\n";
         out << "      \"module_means\": {\"uf\": " << fmt_g(mean_of(cell.uf_sum, cell.shots))
             << ", \"balance\": " << fmt_g(mean_of(cell.balance_sum, cell.shots))
             << ", \"build_crit\": " << fmt_g(mean_of(cell.build_crit_sum, cell.shots))
@@ -1261,6 +1345,9 @@ void write_aggregate(std::ofstream& out, const Options& options, const std::vect
         out << "      \"pred_max_over_pred_sum_times_k_mean\": " << fmt_g(imbalance_mean)
             << ",\n";
         out << "      \"speedup_mean\": " << fmt_g(system_mean > 0 ? fallback_mean / system_mean : 0.0) << ",\n";
+        double system_pipeline_mean = cell.system_pipeline.mean();
+        out << "      \"speedup_pipeline_mean\": "
+            << fmt_g(system_pipeline_mean > 0 ? fallback_mean / system_pipeline_mean : 0.0) << ",\n";
         write_histogram(out, "crit_ncomps_hist", cell.crit_ncomps_hist, ",");
         write_histogram(out, "largest_hist", cell.largest_hist, ",");
         out << "      \"raw_truncated_at_shot\": " << cell.raw_truncated_at_shot << ",\n";
@@ -1326,7 +1413,8 @@ void run_dp_cell(
 
     log << "  dem_has_negative_weights=" << (decoder.dem_has_negative_weights ? 1 : 0)
         << " edge_weight_unit=" << unit << " T_max=" << ball_config.ball.T_max << " R=" << ball_config.ball.R
-        << " n_max=" << n_max << " num_observables=" << num_observables << "\n";
+        << " n_max=" << n_max << " num_observables=" << num_observables
+        << " ball_graph_build_mode=" << (decoder.config.mode == BallGraphBuildMode::BITSET ? "BITSET" : "SCAN") << "\n";
 
     // ---- §5 step 4. Everything allocated here, before the first measured shot.
     Balancer balancer;
@@ -1396,6 +1484,9 @@ void run_dp_cell(
             aggregate.fallback.reserve(options.shots);
             aggregate.sparse_k.reserve(options.shots);
             aggregate.system.reserve(options.shots);
+            aggregate.hbuild.reserve(options.shots);
+            aggregate.pipeline.reserve(options.shots);
+            aggregate.system_pipeline.reserve(options.shots);
 
             log << "  cell T=" << horizon << " k=" << k << " T_weight_units=" << horizon * unit
                 << " T_int=" << (int64_t)decoder.horizon << " started=" << stamp() << "\n";
@@ -1478,7 +1569,9 @@ int main(int argc, char** argv) {
     shots_csv << "d,p,T,k,alpha,shot,n_def,n_comps,largest,escalated,"
                  "pred_max,pred_sum,imbalance,crit_core,crit_size,crit_ncomps,"
                  "ticks_uf,ticks_balance,ticks_build_crit,ticks_solve_crit,ticks_extract_crit,"
-                 "ticks_core_max,ticks_combine,ticks_sparse_k,ticks_fallback,ticks_system\n";
+                 "ticks_core_max,ticks_combine,ticks_sparse_k,ticks_fallback,ticks_system,"
+                 "ticks_seed,ticks_hbuild,ticks_hbuild_intersect,ticks_hbuild_finalize,"
+                 "ticks_pipeline,ticks_system_pipeline\n";
 
     RowArena arena;
     arena.configure(shots_csv);
@@ -1513,8 +1606,18 @@ int main(int argc, char** argv) {
     log << "warm_cache_caveat=1: a load solved immediately after the previous load sees a warmer"
            " cache than a real core would; this travels with every number in shots.csv and"
            " agg.json.\n";
-    log << "timed_region_input=compute_seeded_detection_events + build_ball_graph are the INPUT and"
-           " are outside every timed region\n";
+    log << "timed_region_input=compute_seeded_detection_events + build_ball_graph are the INPUT of the"
+           " k-core model and are in no term of sparse_k or system; they are timed on the CPU into their"
+           " own columns (see timed_region_seed, timed_region_hbuild)\n";
+    log << "timed_region_seed=compute_seeded_detection_events: the negative-weight preamble on G and"
+           " the sorted detection-event list\n";
+    log << "timed_region_hbuild=build_ball_graph end to end, on the CPU. hbuild_intersect and"
+           " hbuild_finalize are the split build_ball_graph measures itself (BallGraphTiming, same"
+           " thread-scoped clock): the ball intersection, then the canonical edge sort and arena"
+           " cleanup. They do not sum to hbuild; the gap is the call's setup and the inner timer's"
+           " three reads, which hbuild includes\n";
+    log << "pipeline=seed + hbuild + sparse_k; system_pipeline=escalated ? fallback :"
+           " min(fallback, pipeline). sparse_k and system are unchanged and still exclude the input\n";
     log << "timed_region_uf=union-find over H's defect-defect edges, component id per defect,"
            " component sizes\n";
     log << "timed_region_balance=cost lookup, LPT assignment, and the scatter of defects, edges and"
