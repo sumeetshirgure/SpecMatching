@@ -4,6 +4,7 @@
 module hc_lane #(
     parameter NUM_SYND    = 38,      // syndrome capacity (sorted-array length)
     parameter LOG_NUM_DET = 12,      // detector id width
+    parameter DELTA_W     = 12,      // signed target offset width, <= LOG_NUM_DET
     parameter WEIGHT_W    = 16       // integer weight width
 ) (
     input  wire                            iClk,
@@ -11,7 +12,7 @@ module hc_lane #(
     input  wire                            iEn,
     input  wire                            iValid,
     input  wire                            iActive,
-    input  wire [WEIGHT_W+LOG_NUM_DET-1:0] iLane,
+    input  wire [WEIGHT_W+DELTA_W-1:0]     iLane,
     input  wire [LOG_NUM_DET-1:0]          iDet,
     input  wire [NUM_SYND*LOG_NUM_DET-1:0] iSynFlat,
     input  wire [NUM_SYND-1:0]             iSynValid,
@@ -24,10 +25,25 @@ module hc_lane #(
     localparam PIPE            = (STAGES > 1) ? STAGES - 1 : 1;             // inter-stage depth
     localparam TRI             = (STAGES > 1) ? STAGES*(STAGES-1)/2 : 1;    // packed path bits
 
-    wire [WEIGHT_W-1:0]    e_w   = iLane[LOG_NUM_DET +: WEIGHT_W];
-    wire [LOG_NUM_DET-1:0] e_tgt = iLane[0 +: LOG_NUM_DET];
+    // An entry is {w, delta}: the target is iDet + delta, so a row names no source detector and
+    // is shared by every detector whose ball is the same shift. Only delta > 0 keeps the pair
+    // (each pair once, from its lower endpoint); delta = 0 never occurs, so the sign bit alone is
+    // the test, and padding is written as delta = -1.
+    wire [WEIGHT_W-1:0]    e_w   = iLane[DELTA_W +: WEIGHT_W];
+    wire [DELTA_W-1:0]     e_dlt = iLane[0 +: DELTA_W];
+    wire [LOG_NUM_DET-1:0] e_dlt_x;
 
-    wire pass = iValid && iActive && (e_tgt > iDet);
+    generate
+        if (DELTA_W < LOG_NUM_DET) begin : g_sext
+            assign e_dlt_x = {{(LOG_NUM_DET-DELTA_W){e_dlt[DELTA_W-1]}}, e_dlt};
+        end else begin : g_nosext
+            assign e_dlt_x = e_dlt;
+        end
+    endgenerate
+
+    wire [LOG_NUM_DET-1:0] e_tgt = iDet + e_dlt_x;
+
+    wire pass = iValid && iActive && !e_dlt[DELTA_W-1];
 
     reg                   s1_v;
     reg [LOG_NUM_DET-1:0] s1_tgt;
