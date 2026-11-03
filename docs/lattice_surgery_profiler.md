@@ -1,6 +1,12 @@
 # `lattice_surgery_profiler` — design
 
-Status: **design only; nothing here is implemented or has been run.** This document records the
+Status: **implemented** in `benchmarks/spec_matching/lattice_surgery_profiler.cc` (generator:
+`lattice_surgery_circuit.h`; analysis: `analyze_lattice_surgery.py`, `plot_lattice_surgery.py`). No
+campaign has been run. Where the implementation departs from this design — most importantly, slab
+defects are phase-1 defects rather than obstacles (§5.1 as written cannot hold `Y(a) <= d(a, b) - T`
+for a cube defect inside a neighbour's ball), and `H`-only defects are re-solved in the speculative
+`H` instance, which makes §10 items 3 and 5 unnecessary — is listed as `deviation_*` in the binary's
+header and in every `run.log`. This document records the
 design discussion behind the lattice-surgery experiment for the evaluation section, and specifies
 the profiler binary that measures it. It replaces the cascaded-fallback sketch of the paper's
 §4.6 (`arxiv/main.tex`, "Lattice surgery"), whose problems are listed in §1.
@@ -123,12 +129,12 @@ depends on §4.6, and must be updated together with it once this experiment has 
 
 | parameter | values for the paper | flag |
 |---|---|---|
-| patches `N` | 2, 4, 8, 16 | `--N` |
-| solver cores per patch `k` | 4, 7, 10 | `--k` |
-| distance `d` | 17, 25, 31 | `--d` |
+| patches `N` | 2, 4, 8 | `--N` |
+| solver cores per patch `k` | 4, 7 | `--k` |
+| distance `d` | 17, 25 | `--d` |
 | physical error rate `p` | `5e-4`, `1e-3`, `3e-3` | `--p` |
 | cutoff `T` | 2 | `--T` |
-| slab width `W` | `T`, `2T`, `4T` | `--W` |
+| slab width `W` | `T`, `2T` | `--W` |
 | orientation | long, short | `--orientation` |
 
 `T` and `W` are in **multiples of `w_p = ln((1−p)/p)`**, as `--T` is in every other binary in this

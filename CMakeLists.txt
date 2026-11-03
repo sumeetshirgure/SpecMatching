@@ -272,6 +272,44 @@ if (NOT (MSVC))
 endif ()
 target_link_libraries(fusion_lb_profiler_debug libstim)
 
+# lattice_surgery_profiler: docs/lattice_surgery_profiler.md. A 1xN lattice-surgery strip cut into N
+# spacetime cubes: each cube runs the fusion solve on its own H with the cross-seam edges masked, a
+# global manager fuses every seam component in one layer, every cube's fallback core runs phase 1 from
+# t = 0, and a truncated cube is resolved locally by the phase-2 hybrid resume. Per shot it logs the
+# makespan of a simulated N(k+2)+1-core schedule against stock decoding of the whole strip. Single
+# thread — no thread is ever spawned. Not in the python wheel.
+#
+# It adds two inert fields to GraphFlooder (a masked boundary slot is skipped, and the outer-layer
+# (t1) hook); both are off on every instance but this binary's fallback instances. The circuit
+# generator is benchmarks/spec_matching/lattice_surgery_circuit.h. Same provenance defines as its
+# companions.
+add_executable(lattice_surgery_profiler benchmarks/spec_matching/lattice_surgery_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(lattice_surgery_profiler PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(lattice_surgery_profiler PRIVATE ${ARCH_OPT})
+target_compile_definitions(lattice_surgery_profiler PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS}"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(lattice_surgery_profiler PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(lattice_surgery_profiler libstim)
+
+# The debug twin of §9.1: `-UNDEBUG` turns on the phase-2 invariant checks (H-only defects at least
+# T from Omega after every closure, no H-only dual above T, injections only on uncovered nodes, the
+# speculative path's dual feasibility after every completed job) and the solver's own asserts.
+add_executable(lattice_surgery_profiler_debug benchmarks/spec_matching/lattice_surgery_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(lattice_surgery_profiler_debug PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(lattice_surgery_profiler_debug PRIVATE ${ARCH_OPT} -UNDEBUG -g)
+target_compile_definitions(lattice_surgery_profiler_debug PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS} -UNDEBUG"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(lattice_surgery_profiler_debug PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(lattice_surgery_profiler_debug libstim)
+
 add_library(libspecmatching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libspecmatching PROPERTIES PREFIX "")
 target_include_directories(libspecmatching PUBLIC src)
