@@ -1,10 +1,10 @@
 #!/bin/bash
 # The lattice-surgery sweep of docs/lattice_surgery_profiler.md §2.3, as cut for the paper:
-# p in {5e-4, 1e-3} (no 3e-3), d in {17, 25}, plus N = 1 as the q reference.
+# p in {5e-4, 1e-3} (no 3e-3), d in {17, 25}, N in {2, 4, 8, 16}, W = 2, long orientation only.
 #
 #   benchmarks/spec_matching/run_lattice_surgery_sweep.sh <results_dir> [shots] [jobs]
 #
-# One profiler process per (N, d, p, orientation) corpus, each running its k x W cells into
+# One profiler process per (N, d, p, orientation) corpus, each running its k cells into
 # <results_dir>/N{N}_d{d}_p{p}_{orientation}/. Up to `jobs` (default 5, the M5 Pro's performance-core
 # count) run at once, largest first. Resumable: a corpus whose run.log ends in status=ok is skipped,
 # so re-running the same command after an interruption only redoes what did not finish. When every
@@ -24,7 +24,7 @@ RESULTS="$(cd "$RESULTS" && pwd)"
 
 # Largest first, so the long corpora are not the last ones started.
 CORPORA=()
-for d in 25 17; do for N in 8 4 2 1; do for p in 0.001 0.0005; do for o in long short; do
+for d in 25 17; do for N in 16 8 4 2; do for p in 0.001 0.0005; do for o in long; do
     CORPORA+=("$N $d $p $o")
 done; done; done; done
 
@@ -37,7 +37,7 @@ run_corpus() {
     fi
     rm -rf "$dir"
     echo "start $dir $(date +%T)"
-    if "$BIN" --N "$N" --k 4,7 --d "$d" --p "$p" --T 2 --W 2,4 --orientation "$o" \
+    if "$BIN" --N "$N" --k 4,7 --d "$d" --p "$p" --T 2 --W 2 --orientation "$o" \
         --shots "$SHOTS" --warmup 1000 --verify --jobs-log sample --out "$dir" > "$dir.stdout" 2>&1; then
         echo "done  $dir $(date +%T)"
     else
@@ -51,7 +51,7 @@ export RESULTS SHOTS BIN
     echo "lattice_surgery sweep: shots=$SHOTS jobs=$JOBS started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "git=$(cd "$ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "cpu=$(sysctl -n machdep.cpu.brand_string) perf_cores=$(sysctl -n hw.perflevel0.physicalcpu)"
-    echo "grid: N in {1,2,4,8}, k in {4,7}, d in {17,25}, p in {5e-4,1e-3}, T=2, W in {2,4}, orientation in {long,short}"
+    echo "grid: N in {2,4,8,16}, k in {4,7}, d in {17,25}, p in {5e-4,1e-3}, T=2, W=2, orientation=long"
 } >> "$RESULTS/sweep.log"
 
 # caffeinate -i keeps the machine from idle-sleeping for as long as the sweep runs.
