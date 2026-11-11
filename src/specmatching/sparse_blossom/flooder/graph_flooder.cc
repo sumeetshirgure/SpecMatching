@@ -40,7 +40,9 @@ GraphFlooder::GraphFlooder(GraphFlooder &&flooder) noexcept
       edge_mask(flooder.edge_mask),
       edge_mask_offsets(flooder.edge_mask_offsets),
       dual_cap(flooder.dual_cap),
-      dual_cap_hit(flooder.dual_cap_hit) {
+      dual_cap_hit(flooder.dual_cap_hit),
+      outer_layer(flooder.outer_layer),
+      outer_layer_hit(flooder.outer_layer_hit) {
 }
 
 void GraphFlooder::do_region_created_at_empty_detector_node(GraphFillRegion &region, DetectorNode &detector_node) {
@@ -51,6 +53,7 @@ void GraphFlooder::do_region_created_at_empty_detector_node(GraphFillRegion &reg
     detector_node.wrapped_radius_cached = 0;
     region.shell_area.push_back(&detector_node);
     reschedule_events_at_detector_node(detector_node);
+    note_node_claimed(detector_node);
 }
 
 /// `Masked` selects between the stock scan and the §4.1 masked one. With `Masked == false` the
@@ -98,14 +101,21 @@ std::pair<size_t, cumulative_time_int> find_next_event_at_node_occupied_by_growi
     size_t best_neighbor = SIZE_MAX;
     size_t start = 0;
     if (!detector_node.neighbors.empty() && detector_node.neighbors[0] == nullptr) {
-        // Growing towards boundary. The boundary half-edge is never masked: a piece's dummy
-        // boundary *is* a boundary edge, and the cut it stands for is carried by the masked
-        // defect-defect edges instead.
-        auto weight = detector_node.neighbor_weights[0];
-        auto collision_time = weight - rad1.y_intercept();
-        if (collision_time < best_time) {
-            best_time = collision_time;
-            best_neighbor = 0;
+        // Growing towards boundary. The fusion driver never masks a boundary half-edge — a piece's
+        // dummy boundary *is* a boundary edge, and the cut it stands for is carried by the masked
+        // defect-defect edges instead — but `lattice_surgery_profiler`'s fallback instance gives
+        // every node a boundary slot and masks the ones that hold no boundary this shot, so a masked
+        // slot is skipped here like any other masked half-edge.
+        bool visible = true;
+        if constexpr (Masked)
+            visible = mask[0] == 0;
+        if (visible) {
+            auto weight = detector_node.neighbor_weights[0];
+            auto collision_time = weight - rad1.y_intercept();
+            if (collision_time < best_time) {
+                best_time = collision_time;
+                best_neighbor = 0;
+            }
         }
         start++;
     }
@@ -227,6 +237,7 @@ void GraphFlooder::do_region_arriving_at_empty_detector_node(
     empty_node.wrapped_radius_cached = empty_node.compute_wrapped_radius();
     region.shell_area.push_back(&empty_node);
     reschedule_events_at_detector_node(empty_node);
+    note_node_claimed(empty_node);
 }
 
 MwpmEvent GraphFlooder::do_region_shrinking(GraphFillRegion &region) {
@@ -481,8 +492,10 @@ MwpmEvent GraphFlooder::run_until_next_mwpm_notification() {
     while (true) {
         // A cap that `note_growth_ending` recorded during the caller's `process_event` is read here,
         // before another event is dequeued: the timeline is already past `dual_cap` and everything
-        // after this point would be solving a different problem.
-        if (dual_cap_hit) {
+        // after this point would be solving a different problem. An outer-layer claim stops it the
+        // same way; `outer_layer_hit` is `nullptr` on every instance but the lattice-surgery
+        // fallback's.
+        if (dual_cap_hit || outer_layer_hit != nullptr) {
             return MwpmEvent::no_event();
         }
         FloodCheckEvent tentative_event = dequeue_valid();
@@ -501,8 +514,8 @@ MwpmEvent GraphFlooder::run_until_next_mwpm_notification() {
         // §4.2's truncation stop. A fired dual cap means some defect's dual would pass `dual_cap`,
         // so the timeline must not go on: report "nothing further happens" and let the driver
         // read the flag. With `dual_cap == NO_HORIZON` this is never set and the stock path is
-        // unchanged.
-        if (dual_cap_hit) {
+        // unchanged. The `(t1)` trigger likewise: the claim has been made, nothing past it has.
+        if (dual_cap_hit || outer_layer_hit != nullptr) {
             return MwpmEvent::no_event();
         }
         if (notification.event_type != NO_EVENT) {

@@ -119,6 +119,21 @@ struct GraphFlooder {
     /// `dual_cap == NO_HORIZON`.
     bool dual_cap_hit{false};
 
+    /// `lattice_surgery_profiler` §7.5 — the `(t1)` trigger of the phase-2 hybrid resume.
+    ///
+    /// One byte per node, indexed like `graph.nodes`: non-zero marks a node on the outer layer of the
+    /// full-resolution territory `Ω`, i.e. a node of `Ω` with a `G`-edge leaving it. The moment a
+    /// region claims such a node — by arriving at it, or by being created on it — `outer_layer_hit`
+    /// is set to that node and `run_until_next_mwpm_notification` stops exactly as it does for a
+    /// fired dual cap, so the driver can grow `Ω` before any part of an edge leaving it is covered.
+    ///
+    /// `nullptr` — the default, and the only value the stock decode path ever sees — costs one
+    /// predicted branch per claimed node and nothing else.
+    const uint8_t* outer_layer{nullptr};
+    /// The outer-layer node whose claim stopped the timeline, or `nullptr`. Never set while
+    /// `outer_layer == nullptr`; the driver reads it and clears it.
+    DetectorNode* outer_layer_hit{nullptr};
+
     GraphFlooder();
     explicit GraphFlooder(MatchingGraph graph);
     GraphFlooder(GraphFlooder&&) noexcept;
@@ -144,6 +159,11 @@ struct GraphFlooder {
     /// lost. The timeline then finishes with that region's defects one unit over `dual_cap`. This is
     /// the tie-break: a cap that was due when growth ended counts as fired.
     void note_growth_ending(GraphFillRegion& region);
+    /// `lattice_surgery_profiler` §7.5: records a claim of `node` if it is on the outer layer.
+    inline void note_node_claimed(DetectorNode& node) {
+        if (outer_layer != nullptr && outer_layer[(size_t)(&node - graph.nodes.data())])
+            outer_layer_hit = &node;
+    }
     void reschedule_events_at_detector_node(DetectorNode& detector_node);
     void do_region_created_at_empty_detector_node(GraphFillRegion& region, DetectorNode& detector_node);
     void do_region_arriving_at_empty_detector_node(
