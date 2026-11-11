@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "verilated.h"
@@ -25,10 +26,9 @@
 
 namespace {
 
-// A build is ~26 chunk cycles plus the lane pipeline, and even a pathological shot in which every
-// batch drains 64 hits one per cycle stays under ~1700. This is an order of magnitude above that:
-// large enough never to cut a legitimate build short, small enough that a hang fails in a moment.
-constexpr long WATCHDOG_CYCLES = 20000;
+// Large enough never to cut a legitimate build short at the generated sizes (a d = 17, p = 3e-3
+// shot is a few thousand cycles), small enough that a hang fails in a moment.
+constexpr long WATCHDOG_CYCLES = 200000;
 
 /// Reads `` `define <name> <integer> `` out of params.vh.
 ///
@@ -130,6 +130,15 @@ int main(int argc, char** argv) {
     // Constructing the model runs ball_sram's $readmemh, which needs CWD == vector dir.
     Vhc_top* top = new Vhc_top{ctx};
 
+    // One "<shot> <cycles>" line per shot, in the format hc_dump writes model_cycles.txt in, so the
+    // cross-check can diff the RTL against the cycle model directly.
+    const std::string cycles_path = vec_dir + "/dut_cycles.txt";
+    FILE* cycles_out = std::fopen(cycles_path.c_str(), "w");
+    if (cycles_out == nullptr) {
+        std::fprintf(stderr, "hc_sim: cannot open %s for writing\n", cycles_path.c_str());
+        return 2;
+    }
+
     int status = 0;
     for (long k = 0; k < num_shots && status == 0; k++) {
         std::vector<long> dets;
@@ -163,7 +172,7 @@ int main(int argc, char** argv) {
         }
 
         // ---- drive the shot and raise iStart for exactly one posedge
-        top->iM = (uint8_t)dets.size();
+        top->iM = (std::remove_reference_t<decltype(top->iM)>)dets.size();
         drive_syndrome(top, dets, log_num_det, syn_words);
         top->iStart = 1;
         top->eval();
@@ -222,7 +231,10 @@ int main(int argc, char** argv) {
         std::printf(
             "hc_sim: shot %-3ld M=%-3zu edges=%-4zu boundary=%-3zu cycles=%ld\n", k, dets.size(), n_edge,
             records.size() - n_edge, cycles + 1);
+        // A zero-defect shot never leaves the controller's idle path; the model counts it as 0.
+        std::fprintf(cycles_out, "%ld %ld\n", k, dets.empty() ? 0L : cycles + 1);
     }
+    std::fclose(cycles_out);
 
     top->final();
     delete top;

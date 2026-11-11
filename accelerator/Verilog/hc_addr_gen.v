@@ -5,6 +5,7 @@ module hc_addr_gen #(
     parameter NUM_SYND        = 38,   // syndrome capacity (max H nodes)
     parameter LOG_NUM_DET     = 12,   // detector id width = ball-table address width
     parameter LOG_MAX_BALL    = 9,    // raw ball length width
+    parameter LOG_NUM_ROWS    = 12,   // ball-table address width (unique rows)
     parameter NUM_LANES       = 64,   // entries per chunk
     parameter CHUNKS_PER_BALL = 4     // NUM_LANES-wide chunks per ball-table word
 ) (
@@ -17,8 +18,9 @@ module hc_addr_gen #(
     output wire                                                               oBndTabRdEn,
     output wire [LOG_NUM_DET-1:0]                                             oBndTabAddr,
     input  wire [LOG_MAX_BALL-1:0]                                            iBndSize,
+    input  wire [LOG_NUM_ROWS-1:0]                                            iBndRow,
     output wire                                                               oBallRdEn,
-    output wire [LOG_NUM_DET-1:0]                                             oBallAddr,
+    output wire [LOG_NUM_ROWS-1:0]                                            oBallAddr,
     output wire                                                               oChValid,
     output wire [$clog2(NUM_SYND+1)-1:0]                                      oRdU,
     output wire [LOG_NUM_DET-1:0]                                             oRdDet,
@@ -47,6 +49,7 @@ module hc_addr_gen #(
     reg [CIDX_W-1:0]        cidx;    // chunk index into the held ball word
     reg                     first_c; // the chunk being issued is its ball's first
     reg [LOG_NUM_LANES-1:0]    bhi;     // last entry's lane offset: bound on the last chunk
+    reg [LOG_NUM_ROWS-1:0]     row;     // ball-table row of the current defect
 
     wire [LOG_NUM_DET-1:0] det_i = iSynFlat[i*LOG_NUM_DET +: LOG_NUM_DET];
 
@@ -61,7 +64,7 @@ module hc_addr_gen #(
     assign oBndTabRdEn = (state == S_NODE) || (load && (ni != iM));
     assign oBndTabAddr = iSynFlat[ni*LOG_NUM_DET +: LOG_NUM_DET];
     assign oBallRdEn   = step && !empty && first_c;
-    assign oBallAddr    = det_i;
+    assign oBallAddr    = row;
     assign oChValid     = step && !empty;
     assign oRdU         = i;
     assign oRdDet       = det_i;
@@ -118,6 +121,7 @@ module hc_addr_gen #(
                 cidx    <= {CIDX_W{1'b0}};
                 first_c <= 1'b1;
                 bhi     <= n_hi;
+                row     <= iBndRow;
             end
         end
 

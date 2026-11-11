@@ -4,12 +4,14 @@
 module h_construct #(
     parameter NUM_SYND        = 38,      // syndrome capacity, max defects per shot (max H nodes)
     parameter LOG_NUM_DET     = 12,      // detector id width = address width of both SRAMs
+    parameter LOG_NUM_ROWS    = 12,      // ball-table address width (unique rows)
     parameter LOG_MAX_BALL    = 9,       // raw ball length width
     parameter WEIGHT_W        = 16,      // integer weight width
+    parameter DELTA_W         = 12,      // signed target offset width, <= LOG_NUM_DET
     parameter NUM_LANES       = 64,      // ball entries searched per cycle
-    parameter LANE_W          = 28,      // one lane field, WEIGHT_W + LOG_NUM_DET
+    parameter LANE_W          = 28,      // one lane field, WEIGHT_W + DELTA_W
     parameter CHUNK_W         = 1792,    // one chunk of a ball-table word, NUM_LANES*LANE_W
-    parameter CHUNKS_PER_BALL = 4        // chunks per ball-table word (one word per node)
+    parameter CHUNKS_PER_BALL = 4        // chunks per ball-table word (one word per unique row)
 ) (
     input  wire                               iClk,
     input  wire                               iRstN,
@@ -18,9 +20,9 @@ module h_construct #(
     input  wire [NUM_SYND*LOG_NUM_DET-1:0]    iSynFlat,
     output wire                               oBndTabRdEn,
     output wire [LOG_NUM_DET-1:0]             oBndTabAddr,
-    input  wire [WEIGHT_W+LOG_MAX_BALL:0]     iBndTabRdata,
+    input  wire [LOG_NUM_ROWS+WEIGHT_W+LOG_MAX_BALL:0] iBndTabRdata,
     output wire                               oBallRdEn,
-    output wire [LOG_NUM_DET-1:0]             oBallAddr,
+    output wire [LOG_NUM_ROWS-1:0]            oBallAddr,
     input  wire [CHUNKS_PER_BALL*CHUNK_W-1:0] iBallRdata,
     output wire                               oEdgeValid,
     output wire [$clog2(NUM_SYND+1)-1:0]      oEdgeU,
@@ -39,6 +41,7 @@ module h_construct #(
     wire                   bnd_hb = iBndTabRdata[WEIGHT_W+LOG_MAX_BALL];
     wire [WEIGHT_W-1:0]    bnd_bw = iBndTabRdata[LOG_MAX_BALL +: WEIGHT_W];
     wire [LOG_MAX_BALL-1:0] bnd_size = iBndTabRdata[0 +: LOG_MAX_BALL];
+    wire [LOG_NUM_ROWS-1:0] bnd_row  = iBndTabRdata[WEIGHT_W+LOG_MAX_BALL+1 +: LOG_NUM_ROWS];
 
     // ---------------- address generator ----------------
     wire                    go, stall, load_busy, ch_valid;
@@ -51,12 +54,12 @@ module h_construct #(
 
     hc_addr_gen #(
         .NUM_SYND(NUM_SYND), .LOG_NUM_DET(LOG_NUM_DET), .LOG_MAX_BALL(LOG_MAX_BALL),
-        .NUM_LANES(NUM_LANES), .CHUNKS_PER_BALL(CHUNKS_PER_BALL)
+        .LOG_NUM_ROWS(LOG_NUM_ROWS), .NUM_LANES(NUM_LANES), .CHUNKS_PER_BALL(CHUNKS_PER_BALL)
     ) u_addr_gen (
         .iClk(iClk), .iRstN(iRstN), .iGo(go), .iStall(stall),
         .iM(iM), .iSynFlat(iSynFlat),
         .oBndTabRdEn(oBndTabRdEn), .oBndTabAddr(oBndTabAddr),
-        .iBndSize(bnd_size),
+        .iBndSize(bnd_size), .iBndRow(bnd_row),
         .oBallRdEn(oBallRdEn), .oBallAddr(oBallAddr),
         .oChValid(ch_valid),
         .oRdU(rd_u), .oRdDet(rd_det), .oRdCh(rd_ch), .oRdHi(rd_hi),
@@ -121,7 +124,7 @@ module h_construct #(
             localparam [LOG_NUM_LANES-1:0] LANE_NO = g;
             hc_lane #(
                 .NUM_SYND(NUM_SYND),
-                .LOG_NUM_DET(LOG_NUM_DET), .WEIGHT_W(WEIGHT_W)
+                .LOG_NUM_DET(LOG_NUM_DET), .DELTA_W(DELTA_W), .WEIGHT_W(WEIGHT_W)
             ) u_lane (
                 .iClk(iClk), .iRstN(iRstN), .iEn(lane_ready),
                 .iValid(batch_valid),

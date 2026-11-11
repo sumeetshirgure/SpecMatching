@@ -24,13 +24,16 @@
 module hc_top #(
     parameter NUM_SYND        = `HC_NUM_SYND,
     parameter LOG_NUM_DET     = `HC_LOG_NUM_DET,
+    parameter LOG_NUM_ROWS    = `HC_LOG_NUM_ROWS,
     parameter LOG_MAX_BALL    = `HC_LOG_MAX_BALL,
     parameter WEIGHT_W        = `HC_WEIGHT_W,
+    parameter DELTA_W         = `HC_DELTA_W,
     parameter NUM_LANES       = `HC_NUM_LANES,
     parameter LANE_W          = `HC_LANE_W,
     parameter CHUNK_W         = `HC_CHUNK_W,
     parameter CHUNKS_PER_BALL = `HC_CHUNKS_PER_BALL,
-    parameter SRAM_DEPTH      = `HC_SRAM_DEPTH,
+    parameter BND_DEPTH       = `HC_BND_DEPTH,
+    parameter BALL_DEPTH      = `HC_BALL_DEPTH,
     parameter BND_WIDTH       = `HC_BND_WIDTH,
     parameter BALL_WIDTH      = `HC_BALL_WIDTH
 ) (
@@ -53,17 +56,17 @@ module hc_top #(
     wire [LOG_NUM_DET-1:0] bnd_addr;
     wire [BND_WIDTH-1:0]   bnd_rdata;
     wire                   ball_rd_en;
-    wire [LOG_NUM_DET-1:0] ball_addr;
+    wire [LOG_NUM_ROWS-1:0] ball_addr;
     wire [BALL_WIDTH-1:0]  ball_rdata;
 
     ball_sram #(
-        .DEPTH(SRAM_DEPTH), .WIDTH(BND_WIDTH), .INIT_FILE(`HC_BND_HEX)
+        .DEPTH(BND_DEPTH), .WIDTH(BND_WIDTH), .INIT_FILE(`HC_BND_HEX)
     ) u_bnd_sram (
         .iClk(iClk), .iEn(bnd_rd_en), .iAddr(bnd_addr), .oRdata(bnd_rdata)
     );
 
     ball_sram #(
-        .DEPTH(SRAM_DEPTH), .WIDTH(BALL_WIDTH), .INIT_FILE(`HC_BALL_HEX)
+        .DEPTH(BALL_DEPTH), .WIDTH(BALL_WIDTH), .INIT_FILE(`HC_BALL_HEX)
     ) u_ball_sram (
         .iClk(iClk), .iEn(ball_rd_en), .iAddr(ball_addr), .oRdata(ball_rdata)
     );
@@ -71,8 +74,10 @@ module hc_top #(
     h_construct #(
         .NUM_SYND(NUM_SYND),
         .LOG_NUM_DET(LOG_NUM_DET),
+        .LOG_NUM_ROWS(LOG_NUM_ROWS),
         .LOG_MAX_BALL(LOG_MAX_BALL),
         .WEIGHT_W(WEIGHT_W),
+        .DELTA_W(DELTA_W),
         .NUM_LANES(NUM_LANES),
         .LANE_W(LANE_W),
         .CHUNK_W(CHUNK_W),

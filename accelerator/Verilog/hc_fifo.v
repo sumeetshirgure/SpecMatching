@@ -40,39 +40,69 @@ module hc_fifo #(
     localparam PTR_W           = $clog2(FIFO_DEPTH);                                            // FIFO pointer width
     localparam CNT_W           = $clog2(FIFO_DEPTH+1);                                          // occupancy width
 
-    localparam [CNT_W-1:0] FIFO_HIGH = FIFO_DEPTH - 1;
+    // two push stages are in flight when oStall rises, so stall two slots early
+    localparam [CNT_W-1:0] FIFO_HIGH = FIFO_DEPTH - 2;
     localparam [CNT_W-1:0] CNT_ZERO  = 0;
 
     localparam [1:0] S_IDLE = 2'd0,
                      S_RUN  = 2'd1,
                      S_DONE = 2'd2;
 
-    // --------- align the chunk sideband with the ball word held on the SRAM output ---------
-    // The loader issues one ball-table read per non-empty ball and the SRAM holds the word
-    // until the next read, so the chunk itself is cut out of iBallRdata here, one cycle
-    // after its sideband was issued, with no holding register of its own.
-    reg              rd_v;     // iBallRdata carries a live chunk this cycle
+    reg              rd_v;
     reg [SB_W-1:0]   rd_sb;
-    reg [CIDX_W-1:0] rd_ch;
 
     always @(posedge iClk or negedge iRstN)
         if (!iRstN) rd_v <= 1'b0;
         else        rd_v <= iChValid;
 
-    always @(posedge iClk) begin
+    always @(posedge iClk)
         rd_sb <= {iRdU, iRdDet, iRdHi};
-        rd_ch <= iRdCh;
-    end
 
 
-    reg [CHUNK_W-1:0] chunk;
-    reg [CIDX_W:0]    ci;   // one bit wider than the index so the bound test cannot wrap
+    // ---------------- chunk cut, select replicated across slices ----------------
+    localparam SEL_COPIES = 8;
+    localparam SLICE_W    = (CHUNK_W + SEL_COPIES - 1) / SEL_COPIES;
 
-    always @* begin
-        chunk = iBallRdata[0 +: CHUNK_W];
-        for (ci = 1; ci < CHUNKS_PER_BALL; ci = ci + 1)
-            if (rd_ch == ci[CIDX_W-1:0])
-                chunk = iBallRdata[ci[CIDX_W-1:0]*CHUNK_W +: CHUNK_W];
+    reg [SEL_COPIES*CIDX_W-1:0] rd_ch_rep;
+    integer kc;
+    always @(posedge iClk)
+        for (kc = 0; kc < SEL_COPIES; kc = kc + 1)
+            rd_ch_rep[kc*CIDX_W +: CIDX_W] <= iRdCh;
+
+    wire [CHUNK_W-1:0] chunk;
+
+    genvar gk;
+    generate
+        for (gk = 0; gk < SEL_COPIES; gk = gk + 1) begin : g_chunk_slice
+            localparam integer LO  = gk * SLICE_W;
+            localparam integer WID = (LO + SLICE_W <= CHUNK_W) ? SLICE_W : (CHUNK_W - LO);
+            if (WID > 0) begin : g_live
+                wire [CIDX_W-1:0] sel_k = rd_ch_rep[gk*CIDX_W +: CIDX_W];
+                reg  [WID-1:0]    slice;
+                reg  [CIDX_W:0]   ci;   // one bit wider than the index so the bound test cannot wrap
+                always @* begin
+                    slice = iBallRdata[LO +: WID];
+                    for (ci = 1; ci < CHUNKS_PER_BALL; ci = ci + 1)
+                        if (sel_k == ci[CIDX_W-1:0])
+                            slice = iBallRdata[ci[CIDX_W-1:0]*CHUNK_W + LO +: WID];
+                end
+                assign chunk[LO +: WID] = slice;
+            end
+        end
+    endgenerate
+
+    // ---------------- registered chunk cut ----------------
+    reg [CHUNK_W-1:0] chunk_q;
+    reg [SB_W-1:0]    rd_sb2;
+    reg               rd_v2;
+
+    always @(posedge iClk or negedge iRstN)
+        if (!iRstN) rd_v2 <= 1'b0;
+        else        rd_v2 <= rd_v;
+
+    always @(posedge iClk) begin
+        chunk_q <= chunk;
+        rd_sb2  <= rd_sb;
     end
 
     // ---------------- batch FIFO ----------------
@@ -80,39 +110,59 @@ module hc_fifo #(
     reg [PTR_W-1:0]  wptr, rptr;
     reg [CNT_W-1:0]  cnt;
 
-    wire empty = (cnt == CNT_ZERO);
-    wire push  = rd_v;
-    wire pop   = !empty && iLaneReady;
+    // --------- occupancy flags, registered from cnt_next ---------
+    reg  mem_empty;
+    reg  stall_q;
+    wire push = rd_v2;
+
+    // --------- registered output stage (first-word-fall-through) ---------
+    reg              o_v;
+    reg [SLOT_W-1:0] o_d;
+
+    wire o_shift = !o_v || iLaneReady;        // the output register is free, or is being consumed
+    wire pop     = o_shift && !mem_empty;     // ... and a slot is there to take, so one leaves
+
+    always @(posedge iClk or negedge iRstN)
+        if (!iRstN)       o_v <= 1'b0;
+        else if (o_shift) o_v <= !mem_empty;
+
+    always @(posedge iClk)
+        if (pop) o_d <= mem[rptr];
+
+    wire [CNT_W-1:0] cnt_next = (push && !pop) ? cnt + 1'b1 :
+                                (pop && !push) ? cnt - 1'b1 : cnt;
 
     always @(posedge iClk or negedge iRstN)
         if (!iRstN) begin
-            wptr <= {PTR_W{1'b0}};
-            rptr <= {PTR_W{1'b0}};
-            cnt  <= CNT_ZERO;
+            wptr      <= {PTR_W{1'b0}};
+            rptr      <= {PTR_W{1'b0}};
+            cnt       <= CNT_ZERO;
+            mem_empty <= 1'b1;
+            stall_q   <= 1'b0;
         end else begin
             if (push) wptr <= wptr + 1'b1;
             if (pop)  rptr <= rptr + 1'b1;
-            case ({push, pop})
-                2'b10:   cnt <= cnt + 1'b1;
-                2'b01:   cnt <= cnt - 1'b1;
-                default: cnt <= cnt;
-            endcase
+            cnt       <= cnt_next;
+            mem_empty <= (cnt_next == CNT_ZERO);
+            stall_q   <= (cnt_next >= FIFO_HIGH);
         end
 
     always @(posedge iClk)
-        if (push) mem[wptr] <= {chunk, rd_sb};
+        if (push) mem[wptr] <= {chunk_q, rd_sb2};
 
-    wire [SLOT_W-1:0] head = mem[rptr];
-
-    assign oBatchValid = !empty;
-    assign oBatchWord  = head[SB_W +: CHUNK_W];
-    assign oBatchU     = head[LOG_NUM_DET+LOG_NUM_LANES +: LOG_NUM_SYND_P1];
-    assign oBatchDet   = head[LOG_NUM_LANES +: LOG_NUM_DET];
-    assign oBatchHi    = head[0 +: LOG_NUM_LANES];
-    assign oStall       = (cnt >= FIFO_HIGH);
+    assign oBatchValid = o_v;
+    assign oBatchWord  = o_d[SB_W +: CHUNK_W];
+    assign oBatchU     = o_d[LOG_NUM_DET+LOG_NUM_LANES +: LOG_NUM_SYND_P1];
+    assign oBatchDet   = o_d[LOG_NUM_LANES +: LOG_NUM_DET];
+    assign oBatchHi    = o_d[0 +: LOG_NUM_LANES];
+    assign oStall      = stall_q;
 
     // ---------------- run / done ----------------
-    wire quiet = !iLoadBusy && !rd_v && empty &&
+    // a batch held in the output register is not drained yet
+    wire empty = mem_empty && !o_v;
+
+    // both push stages count as busy
+    wire quiet = !iLoadBusy && !rd_v && !rd_v2 && empty &&
                  !iLaneBusy && !iCollectBusy && !iBndBusy;
 
     reg [1:0] state;
