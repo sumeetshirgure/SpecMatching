@@ -48,6 +48,7 @@ module hc_fifo #(
                      S_RUN  = 2'd1,
                      S_DONE = 2'd2;
 
+    reg              rd_v;
     reg [SB_W-1:0]   rd_sb;
 
     always @(posedge iClk or negedge iRstN)

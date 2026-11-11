@@ -1,7 +1,7 @@
 // Table compiler and vector generator for the h_construct accelerator.
 //
 //     hc_dump <out-dir> [--d 5] [--rounds 5] [--p 0.005] [--shots 20] [--keep 0] [--seed 7] [--lanes 64]
-//                       [--time-coord -1] [--no-prune] [--no-dedup] [--stats-only]
+//                       [--time-coord -1] [--no-prune] [--no-dedup] [--stats-only] [--dist-csv <path>]
 //
 // Compiles the software ball tables (`compile_ball_tables`, T = T_max = 2 lattice edge weights,
 // R = 2T) for a generated rotated-surface-code memory experiment and re-encodes them into the two
@@ -34,6 +34,12 @@
 // per-shot cycle model of the RTL evaluated on the sampled shots for every lane count in
 // {16, 32, 64, 128}, both for the compressed tables and for the legacy layout (one full ball per
 // detector, absolute targets), so a single run reports the change in table size and in latency.
+//
+// `--dist-csv <path>` additionally writes one row per shot for the *legacy* layout at per-shot
+// capacity: `shot,n_defects,edges` then `cycles_L<L>,fetch_L<L>,drain_L<L>` for each lane count.
+// `edges` does not depend on the lane count; the per-lane batch count is `edges - drain_L<L>`.
+// It is the per-shot form of the aggregated `legacy_*` stats fields, for the latency distribution
+// in accelerator/sweep_dist/, and it changes no other output.
 
 #include <algorithm>
 #include <cmath>
@@ -77,6 +83,7 @@ struct Options {
     bool prune = true;
     bool dedup = true;
     bool stats_only = false;
+    std::string dist_csv;  // empty: no per-shot legacy dump
 };
 
 size_t clog2(uint64_t x) {
@@ -242,11 +249,12 @@ size_t signed_width(int64_t lo, int64_t hi) {
 ///
 /// A register-level replay of the control path, not a closed form: the address generator's
 /// slots (one per unstalled S_SCAN cycle, `max(1, chunks)` per defect, a chunk issued in each slot
-/// of a non-empty ball), the one-cycle SRAM/sideband stage, the batch FIFO and its `cnt >= 3`
-/// stall, the lane pipeline of depth `1 + clog2(cap + 1)` frozen while the collector is not ready,
-/// the collector draining one hit per cycle, and the done FSM's quiet test. Only the hit count of
-/// each batch is carried, since that is all the timing depends on. It is the RTL's sum
-/// `7 + clog2(cap + 1) + fetch + drain` except where scan slots hide under a drain (e.g. a trailing
+/// of a non-empty ball), the two cycles between the SRAM read and the FIFO write (the sideband
+/// stage and the registered chunk cut), the batch FIFO with its `cnt >= 2` stall and its registered
+/// output slot, the lane pipeline of depth `1 + clog2(cap + 1)` frozen while the collector is not
+/// ready, the collector draining one hit per cycle, and the done FSM's quiet test. Only the hit
+/// count of each batch is carried, since that is all the timing depends on. It is the RTL's sum
+/// `9 + clog2(cap + 1) + fetch + drain` except where scan slots hide under a drain (e.g. a trailing
 /// empty ball, which pruning makes common), and run_crosscheck.sh checks it cycle-exact.
 ///
 /// `cap` is the syndrome capacity NUM_SYND of the instance; `cap = 0` uses the per-shot `M`, which
@@ -256,6 +264,7 @@ struct ShotModel {
     uint64_t cycles{0};
     uint64_t fetch{0};
     uint64_t drain{0};
+    uint64_t hits{0};
 };
 
 template <typename RowOf>
@@ -286,6 +295,7 @@ ShotModel model_shot(
                     h++;
             }
             hits[i].push_back(h);
+            m.hits += h;
             if (h > 1)
                 m.drain += h - 1;
         }
@@ -293,14 +303,18 @@ ShotModel model_shot(
 
     enum { S_IDLE, S_NODE, S_HDR, S_SCAN };
     const size_t lat = 1 + clog2((cap > 0 ? cap : num) + 1);
-    const int fifo_high = 3;  // hc_fifo: FIFO_DEPTH - 1
+    const int fifo_high = 2;  // hc_fifo: FIFO_DEPTH - 2
 
     int ag = S_IDLE;  // hc_addr_gen
     size_t i = 0, ni = 0, ccnt = 0;
     bool rd_v = false;  // hc_fifo's SRAM-aligned sideband stage
     uint32_t rd_hits = 0;
+    bool rd_v2 = false;  // hc_fifo's registered chunk cut, the stage that pushes
+    uint32_t rd_hits2 = 0;
     std::vector<uint32_t> fifo;  // hit count of each buffered batch
     size_t fifo_head = 0;
+    bool o_v = false;    // hc_fifo's output slot, popped out of mem one cycle before it is seen
+    uint32_t o_d = 0;
     std::vector<int64_t> pipe(lat, -1);  // lane pipeline, -1 = bubble
     uint32_t pend = 0;                   // hc_collect: hits still to emit
     bool bnd_v = false;                  // hc_bnd_check's oBndValid
@@ -321,7 +335,9 @@ ShotModel model_shot(
         bool ready = pend <= 1;
         bool take = ready && pipe[lat - 1] >= 0;
         bool bnd_busy = load || bnd_v;
-        bool quiet = ag == S_IDLE && !rd_v && cnt == 0 && pend == 0 && !bnd_busy &&
+        bool o_shift = !o_v || ready;   // the output slot is free, or is being consumed
+        bool pop = o_shift && cnt > 0;
+        bool quiet = ag == S_IDLE && !rd_v && !rd_v2 && cnt == 0 && !o_v && pend == 0 && !bnd_busy &&
                      std::all_of(pipe.begin(), pipe.end(), [](int64_t v) { return v < 0; });
 
         // ---- registers
@@ -357,11 +373,17 @@ ShotModel model_shot(
             ccnt = hits[load_det].size();
         bnd_v = load && hb[shot[load_det]];
 
-        int64_t head = cnt > 0 ? (int64_t)fifo[fifo_head] : -1;
-        if (ready && cnt > 0)
+        int64_t head = o_v ? (int64_t)o_d : -1;
+        if (pop) {
+            o_d = fifo[fifo_head];
             fifo_head++;
-        if (rd_v)
-            fifo.push_back(rd_hits);
+        }
+        if (o_shift)
+            o_v = cnt > 0;
+        if (rd_v2)
+            fifo.push_back(rd_hits2);
+        rd_v2 = rd_v;
+        rd_hits2 = rd_hits;
         rd_v = ch_valid;
         rd_hits = ch_hits;
 
@@ -416,6 +438,8 @@ void parse_args(int argc, char** argv, Options& opt) {
             opt.dedup = false;
         else if (a == "--stats-only")
             opt.stats_only = true;
+        else if (a == "--dist-csv")
+            opt.dist_csv = next();
         else
             throw std::invalid_argument("unknown option " + a);
     }
@@ -495,10 +519,20 @@ int run(int argc, char** argv) {
         sum_new_drain(4, 0), sum_legacy_drain(4, 0);
     std::vector<uint64_t> max_new(4, 0), max_legacy(4, 0);
     std::vector<uint64_t> shot_cycles;  // at --lanes, compressed tables, capacity = num_synd
+    struct DistRow {
+        size_t m;
+        uint64_t edges;
+        uint64_t cycles[4], fetch[4], drain[4];
+    };
+    std::vector<DistRow> dist_rows;
+    if (!opt.dist_csv.empty())
+        dist_rows.reserve(corpus.shots.size());
     for (const auto& shot : corpus.shots) {
         sum_m += (double)shot.size();
         for (uint64_t det : shot)
             is_defect[det] = 1;
+        DistRow dr{};
+        dr.m = shot.size();
         for (size_t li = 0; li < 4; li++) {
             size_t L = MODEL_LANES[li];
             ShotModel a = model_shot(shot, is_defect, c.det_hb, L, 0, [&](uint64_t det) -> const std::vector<uint32_t>& {
@@ -515,7 +549,13 @@ int run(int argc, char** argv) {
             sum_legacy_drain[li] += (double)b.drain;
             max_new[li] = std::max(max_new[li], a.cycles);
             max_legacy[li] = std::max(max_legacy[li], b.cycles);
+            dr.edges = b.hits;  // the hit count does not depend on the lane count
+            dr.cycles[li] = b.cycles;
+            dr.fetch[li] = b.fetch;
+            dr.drain[li] = b.drain;
         }
+        if (!opt.dist_csv.empty())
+            dist_rows.push_back(dr);
         shot_cycles.push_back(
             model_shot(shot, is_defect, c.det_hb, opt.lanes, num_synd, [&](uint64_t det) -> const std::vector<uint32_t>& {
                 return new_targets[det];
@@ -554,6 +594,25 @@ int run(int argc, char** argv) {
     FILE* sf = open_or_die(opt.out_dir + "/stats.txt", "w");
     std::fprintf(sf, "%s\n", stats.c_str());
     std::fclose(sf);
+
+    if (!opt.dist_csv.empty()) {
+        FILE* df = open_or_die(opt.dist_csv, "w");
+        std::fprintf(df, "shot,n_defects,edges");
+        for (size_t li = 0; li < 4; li++)
+            std::fprintf(df, ",cycles_L%zu,fetch_L%zu,drain_L%zu", MODEL_LANES[li], MODEL_LANES[li],
+                         MODEL_LANES[li]);
+        std::fprintf(df, "\n");
+        for (size_t k = 0; k < dist_rows.size(); k++) {
+            const DistRow& dr = dist_rows[k];
+            std::fprintf(df, "%zu,%zu,%llu", k, dr.m, (unsigned long long)dr.edges);
+            for (size_t li = 0; li < 4; li++)
+                std::fprintf(df, ",%llu,%llu,%llu", (unsigned long long)dr.cycles[li],
+                             (unsigned long long)dr.fetch[li], (unsigned long long)dr.drain[li]);
+            std::fprintf(df, "\n");
+        }
+        std::fclose(df);
+    }
+
     if (opt.stats_only)
         return 0;
 
